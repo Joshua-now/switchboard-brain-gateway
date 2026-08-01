@@ -285,6 +285,128 @@ function completionJson(model, reply) {
         };
 }
 
+// Telnyx voice sends stream=true. Instead of waiting for the ENTIRE brain reply
+// (which ran ~3-7s and timed out the turn -> dead air), open the Telnyx stream
+// immediately and forward the brain's words AS THEY ARE GENERATED. Speech streams
+// live; a tool ACTION (which the brain emits as the whole reply) is buffered, then
+// sent as a tool_call. Never dead air: a stall/error still yields a holding line.
+async function streamBrainToTelnyx(res, tenantId, model, tools, messages) {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  const id = `chatcmpl-${Date.now()}`;
+  const base = { id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: model || "switchboard-brain" };
+  const send = (delta, fin) => res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta, finish_reason: fin || null }] })}\n\n`);
+  const finish = () => { try { res.write("data: [DONE]\n\n"); res.end(); } catch {} };
+
+  send({ role: "assistant" }, null); // open the turn immediately so Telnyx sees the stream is live
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), BRAIN_DEADLINE_MS);
+  const t0 = Date.now();
+  let firstAt = 0;          // ms to first token (reveals whether the brain streams)
+  let mode = "deciding";    // deciding | speech | action
+  let full = "";
+  let spoke = false;
+
+  const flushSpeech = () => {
+    const cleaned = cleanForVoice(full);
+    if (cleaned) { send({ content: cleaned }, null); spoke = true; }
+    mode = "speech";
+  };
+
+  try {
+    const memory = await loadTenantMemory(tenantId);
+    const input = buildBrainInput(messages, memory, tools);
+
+    const startRes = await fetch(`${HERMES_URL}/v1/runs`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${HERMES_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ input }),
+      signal: ctrl.signal,
+    });
+    if (!startRes.ok) throw new Error(`brain start HTTP ${startRes.status}`);
+    const startJson = await startRes.json();
+    const runId = startJson.run_id || startJson.id || (startJson.data && startJson.data.run_id);
+    if (!runId) throw new Error("brain returned no run id");
+
+    const evRes = await fetch(`${HERMES_URL}/v1/runs/${runId}/events`, {
+      headers: { Authorization: `Bearer ${HERMES_API_KEY}` },
+      signal: ctrl.signal,
+    });
+    if (!evRes.ok || !evRes.body) throw new Error(`brain events HTTP ${evRes.status}`);
+
+    const reader = evRes.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let finalOutput = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop() || "";
+      for (const line of lines) {
+        const s = line.trim();
+        if (!s.startsWith("data:")) continue;
+        const payload = s.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        let ev;
+        try { ev = JSON.parse(payload); } catch { continue; }
+        if (ev.event === "message.delta" && typeof ev.delta === "string") {
+          if (!firstAt) firstAt = Date.now() - t0;
+          full += ev.delta;
+          if (mode === "deciding") {
+            const head = full.replace(/^\s+/, "");
+            if (head.toUpperCase().startsWith("ACTION:")) mode = "action";
+            else if (head.length >= 7) flushSpeech(); // enough to know it is NOT an action
+          } else if (mode === "speech") {
+            const cleaned = cleanForVoice(ev.delta);
+            if (cleaned) { send({ content: cleaned }, null); spoke = true; }
+          }
+          // action mode: keep accumulating in `full`, emit nothing yet
+        }
+        if (ev.event === "run.completed") finalOutput = ev.output || full || finalOutput;
+      }
+    }
+    clearTimeout(timer);
+
+    const finalText = (finalOutput || full || "").trim();
+    if (mode === "deciding") { // reply too short to decide mid-stream — decide now
+      const head = finalText.replace(/^\s+/, "");
+      if (head.toUpperCase().startsWith("ACTION:")) mode = "action";
+      else { full = finalText; flushSpeech(); }
+    }
+
+    if (mode === "action") {
+      const reply = parseBrainReply(finalText, tools);
+      if (reply.toolCall) {
+        send({ tool_calls: [{ index: 0, id: `call_${Date.now()}`, type: "function", function: { name: reply.toolCall.name, arguments: JSON.stringify(reply.toolCall.arguments || {}) } }] }, null);
+        send({}, "tool_calls");
+        log(tenantId, `brain streamed in ${Date.now() - t0}ms (first ${firstAt || "-"}ms) -> action:${reply.toolCall.name}`);
+      } else { // malformed/unknown ACTION -> fail-safe: speak it
+        const spoken = cleanForVoice(reply.content || finalText || HOLDING_LINE);
+        if (!spoke && spoken) send({ content: spoken }, null);
+        send({}, "stop");
+        log(tenantId, `brain streamed in ${Date.now() - t0}ms -> speech (action fallback)`);
+      }
+    } else {
+      if (!spoke) send({ content: HOLDING_LINE }, null);
+      send({}, "stop");
+      log(tenantId, `brain streamed in ${Date.now() - t0}ms (first token ${firstAt || "-"}ms) -> speech`);
+    }
+    finish();
+    const lastUser = [...messages].reverse().find((m) => m.role === "user");
+    saveTenantTurn(tenantId, lastUser && lastUser.content, finalText).catch(() => {});
+  } catch (e) {
+    clearTimeout(timer);
+    log(tenantId, "brain stream failed:", e.message, "-> holding line");
+    if (!spoke) { try { send({ content: HOLDING_LINE }, null); } catch {} }
+    try { send({}, "stop"); } catch {}
+    finish();
+  }
+}
+
 function streamChunks(res, model, reply) {
         res.setHeader("Content-Type", "text/event-stream");
         res.setHeader("Cache-Control", "no-cache");
@@ -342,6 +464,11 @@ app.post("/t/:tenantId/v1/chat/completions", async (req, res) => {
            if (LOG_REQUEST_SHAPE) {
                      log(tenantId, `turn: msgs=${messages.length} tools=${tools.length}${tools.length ? " [" + tools.map((t) => t.name).join(",") + "]" : ""} tool_choice=${JSON.stringify(tool_choice) || "none"} stream=${!!stream}`);
            }
+
+           // Telnyx voice uses stream=true -> STREAM the brain's words as they are
+           // generated (first words in ~1s instead of waiting the full 3-7s, which
+           // timed out the turn). Non-stream callers get the buffered path below.
+           if (stream) return streamBrainToTelnyx(res, tenantId, model, tools, messages);
 
            let reply;
         try {
