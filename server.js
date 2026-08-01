@@ -309,6 +309,21 @@ async function streamBrainToTelnyx(res, tenantId, model, tools, messages) {
   let full = "";
   let spoke = false;
 
+  // Voice bridge: Telnyx abandons the turn (dead air) if the first SPOKEN word is
+  // slow, and the brain's first token runs ~3-8s. If nothing has been spoken shortly
+  // after the turn opens, say a brief natural filler so the caller hears a voice and
+  // Telnyx keeps listening -- the real answer then streams in right behind it.
+  const BRIDGE_MS = Number(process.env.BRIDGE_MS || 800);
+  const BRIDGES = (process.env.BRIDGES || "One moment.|Let me check on that.|Sure, one second.|Okay, let me see.").split("|");
+  const bridgeTimer = setTimeout(() => {
+    if (!spoke && mode !== "action") {
+      const line = BRIDGES[Math.floor(Math.random() * BRIDGES.length)];
+      send({ content: line + " " }, null);
+      spoke = true; // the brain's real answer still follows; also suppresses the default holding line
+      log(tenantId, `bridged after ${BRIDGE_MS}ms (brain still thinking)`);
+    }
+  }, BRIDGE_MS);
+
   const flushSpeech = () => {
     const cleaned = cleanForVoice(full);
     if (cleaned) { send({ content: cleaned }, null); spoke = true; }
@@ -369,7 +384,7 @@ async function streamBrainToTelnyx(res, tenantId, model, tools, messages) {
         if (ev.event === "run.completed") finalOutput = ev.output || full || finalOutput;
       }
     }
-    clearTimeout(timer);
+    clearTimeout(timer); clearTimeout(bridgeTimer);
 
     const finalText = (finalOutput || full || "").trim();
     if (mode === "deciding") { // reply too short to decide mid-stream — decide now
@@ -399,7 +414,7 @@ async function streamBrainToTelnyx(res, tenantId, model, tools, messages) {
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
     saveTenantTurn(tenantId, lastUser && lastUser.content, finalText).catch(() => {});
   } catch (e) {
-    clearTimeout(timer);
+    clearTimeout(timer); clearTimeout(bridgeTimer);
     log(tenantId, "brain stream failed:", e.message, "-> holding line");
     if (!spoke) { try { send({ content: HOLDING_LINE }, null); } catch {} }
     try { send({}, "stop"); } catch {}
