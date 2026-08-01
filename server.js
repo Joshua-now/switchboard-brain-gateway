@@ -46,6 +46,12 @@ const HERMES_API_KEY = process.env.HERMES_API_KEY || ""; // the brain's API_SERV
 
 const GATEWAY_API_KEY = process.env.GATEWAY_API_KEY || ""; // Telnyx presents this as Bearer
 
+// Universal template placeholder. Every Hermes bot is a byte-identical clone whose
+// base URL is /t/<PLACEHOLDER>/v1; the real tenant rides in via metadata.client_id.
+// When a call carries no client_id (e.g. the dynamic-vars webhook hiccupped), the
+// gateway serves a SAFE GENERIC response for this placeholder instead of dead-airing.
+const PLACEHOLDER_TENANT = (process.env.PLACEHOLDER_TENANT || "_").trim();
+
 // Tenant allowlist - used ONLY when DATABASE_URL is not set (fallback mode).
 const ALLOWED_TENANTS = new Set(
         (process.env.ALLOWED_TENANTS || "").split(",").map((s) => s.trim()).filter(Boolean)
@@ -147,6 +153,15 @@ async function resolveTenant(req, res) {
         if (!tenantId) {
                   res.status(400).json({ error: { message: "Missing tenant", type: "invalid_request" } });
                   return null;
+        }
+        // Placeholder tenant (no client_id came through): allow it as a GENERIC caller
+        // so the bot NEVER dead-airs. Auth (requireCallerAuth) already gated the request,
+        // and no tenant-specific data is loaded for the placeholder - it just speaks
+        // generically from whatever instructions Telnyx sent. Real tenants (from
+        // metadata.client_id) are still gated by isTenantAllowed below.
+        if (tenantId === PLACEHOLDER_TENANT) {
+                  if (LOG_REQUEST_SHAPE) log(tenantId, "placeholder tenant -> serving generic (no client_id in metadata)");
+                  return tenantId;
         }
         if (!(await isTenantAllowed(tenantId))) {
                   log(tenantId, `REFUSED - unknown or not ACTIVE (source: ${fromMeta ? "metadata" : "url"})`);
