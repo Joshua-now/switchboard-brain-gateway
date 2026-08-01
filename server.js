@@ -56,6 +56,10 @@ const DATABASE_URL = process.env.DATABASE_URL || "";
 const TENANT_CACHE_TTL_MS = Number(process.env.TENANT_CACHE_TTL_MS || 30000);
 
 const BRAIN_DEADLINE_MS = Number(process.env.BRAIN_DEADLINE_MS || 18000);
+// The whole transcript is replayed to the brain every turn, so latency CLIMBS as a call
+// grows (more prefill). Cap how many caller/assistant turns we send; instructions/system
+// are always kept. Tune per bot via env; 0 disables the cap.
+const MAX_HISTORY_MSGS = Number(process.env.MAX_HISTORY_MSGS || 12);
 const HOLDING_LINE = process.env.HOLDING_LINE || "Give me just one second.";
 
 // Log the shape of each incoming turn (tool presence, names) so we can verify the
@@ -147,10 +151,20 @@ function normalizeTools(tools) {
  * Flatten the OpenAI messages[] into a single transcript for Hermes, and - when
  * tools are present - describe them and how to invoke one via a single ACTION line.
  */
+// Keep the system/instructions messages, but only the last MAX_HISTORY_MSGS caller/assistant
+// turns. Stops per-turn latency from climbing as the conversation gets longer.
+function capHistory(messages) {
+        if (!Array.isArray(messages) || MAX_HISTORY_MSGS <= 0) return messages;
+        const sys = messages.filter((m) => m && m.role === "system");
+        const convo = messages.filter((m) => m && m.role !== "system");
+        if (convo.length <= MAX_HISTORY_MSGS) return messages;
+        return [...sys, ...convo.slice(-MAX_HISTORY_MSGS)];
+}
+
 function buildBrainInput(messages, memory, tools) {
         const parts = [];
         if (memory) parts.push(`What you remember about this contact/company:\n${memory}\n`);
-        for (const m of messages || []) {
+        for (const m of capHistory(messages) || []) {
                   let role;
                   if (m.role === "assistant") role = "Assistant";
                   else if (m.role === "system") role = "Instructions";
