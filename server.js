@@ -116,17 +116,44 @@ async function isTenantAllowed(tenantId) {
         }
 }
 
+/**
+ * Pull the tenant id out of the metadata Telnyx forwards on every call.
+ * When "Forward metadata" is ON, Telnyx adds a top-level `extra_metadata` object
+ * to the chat-completions body carrying the dynamic variables our webhook stamped
+ * on this call - including `client_id`. That is what lets EVERY assistant be a
+ * byte-identical clone pointed at ONE generic URL: the call carries its own owner.
+ * We accept the common spellings in case the dynamic-variable name ever differs.
+ */
+function tenantFromMetadata(req) {
+        const m = req.body && req.body.extra_metadata;
+        if (!m || typeof m !== "object") return "";
+        const raw = m.client_id ?? m.clientId ?? m.tenant_id ?? m.tenantId ?? "";
+        return String(raw).trim();
+}
+
+/**
+ * Which contractor is this call for? Two sources, in priority order:
+ *   1. extra_metadata.client_id  - stamped on the call by the dynamic-vars webhook.
+ *      This is the path that makes byte-identical clones work (zero post-clone edits).
+ *   2. URL path /t/<tenantId>/    - the original per-tenant-URL scheme, kept as a
+ *      fallback so every existing assistant keeps working with no changes.
+ * Whatever we resolve STILL has to pass isTenantAllowed() (ACTIVE in the DB), so a
+ * bogus client_id can never reach another tenant's brain. Fail closed, as always.
+ */
 async function resolveTenant(req, res) {
-        const tenantId = String(req.params.tenantId || "").trim();
+        const fromMeta = tenantFromMetadata(req);
+        const fromUrl = String(req.params.tenantId || "").trim();
+        const tenantId = fromMeta || fromUrl;
         if (!tenantId) {
                   res.status(400).json({ error: { message: "Missing tenant", type: "invalid_request" } });
                   return null;
         }
         if (!(await isTenantAllowed(tenantId))) {
-                  log(tenantId, "REFUSED - unknown or not ACTIVE");
+                  log(tenantId, `REFUSED - unknown or not ACTIVE (source: ${fromMeta ? "metadata" : "url"})`);
                   res.status(403).json({ error: { message: "Unknown or disabled tenant", type: "tenant_denied" } });
                   return null;
         }
+        if (LOG_REQUEST_SHAPE) log(tenantId, `tenant via ${fromMeta ? "metadata.client_id" : "url path"}`);
         return tenantId;
 }
 
@@ -492,6 +519,10 @@ app.post("/t/:tenantId/v1/chat/completions", async (req, res) => {
            // Contract probe: record what Telnyx actually sends (shape only, no content).
            if (LOG_REQUEST_SHAPE) {
                      log(tenantId, `turn: msgs=${messages.length} tools=${tools.length}${tools.length ? " [" + tools.map((t) => t.name).join(",") + "]" : ""} tool_choice=${JSON.stringify(tool_choice) || "none"} stream=${!!stream}`);
+                     // Which metadata keys did Telnyx forward? Keys only (no caller data),
+                     // so we can confirm client_id actually rides in on the first live call.
+                     const em = req.body && req.body.extra_metadata;
+                     if (em && typeof em === "object") log(tenantId, `extra_metadata keys: [${Object.keys(em).join(", ")}]`);
            }
 
            // Telnyx voice uses stream=true -> STREAM the brain's words as they are
